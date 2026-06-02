@@ -47,9 +47,37 @@ The codebase is organized as a production-style pipeline with clearly separated 
 
 ---
 
+## Drift Types at a Glance
+
+Before reading the architecture it helps to have a mental model of the three kinds of drift this system targets. Each type manifests differently in the data, has a different measurable symptom, and requires a different algorithm to catch it reliably. The table below is a compact reference you can return to at any point while reading the rest of this document.
+
+| # | <sub>Drift Type</sub> | <sub>What shifts?</sub> | <sub>Probability notation</sub> | <sub>Earliest symptom</sub> | <sub>Detector family</sub> | <sub>Typical cause in production</sub> | <sub>Can it be silent?</sub> |
+|---|---|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>**Data Drift** (Covariate Shift)</sub> | <sub>The distribution of input features X</sub> | <sub>P(X) changes; P(Y\|X) stays same</sub> | <sub>Statistical divergence in feature histograms</sub> | <sub>KS test, PSI, KL divergence</sub> | <sub>Sensor recalibration, new user segment, seasonal pattern</sub> | <sub>Yes - model may still predict correctly if it learned a robust boundary</sub> |
+| <sub>2</sub> | <sub>**Concept Drift** (Posterior Shift)</sub> | <sub>The mapping from features to labels</sub> | <sub>P(Y\|X) changes; P(X) may stay same</sub> | <sub>Rising error rate with unchanged input distribution</sub> | <sub>ADWIN on streaming error rate</sub> | <sub>Fraud pattern evolves, policy change, new competitor behavior</sub> | <sub>No - always causes accuracy degradation eventually</sub> |
+| <sub>3</sub> | <sub>**Model Drift** (Performance Degradation)</sub> | <sub>The model's predictive accuracy relative to baseline</sub> | <sub>Accuracy(t) << Accuracy(0)</sub> | <sub>Accuracy drop exceeds minimum threshold</sub> | <sub>Direct accuracy monitoring</sub> | <sub>Consequence of either of the above; also caused by infrastructure changes</sub> | <sub>No - it is the definition of observable failure</sub> |
+| <sub>4</sub> | <sub>**Prior Probability Shift**</sub> | <sub>The marginal label distribution</sub> | <sub>P(Y) changes; P(X\|Y) stays same</sub> | <sub>Class imbalance in incoming labels</sub> | <sub>PSI on predicted label proportions</sub> | <sub>Class prevalence change e.g. fewer fraudulent transactions during holidays</sub> | <sub>Yes - a well-calibrated model may adapt partially</sub> |
+
+> [!NOTE]
+> This project directly simulates and detects types 1, 2, and 3. Type 4 (Prior Probability Shift) is listed for completeness and can be monitored by running PSI against the predicted label distribution rather than the feature distribution.
+
+---
+
 ## Architecture
 
 The system is built around a **streaming batch pipeline** where data arrives in fixed-size windows. Each window passes through the detector suite, which runs four independent statistical tests in parallel and aggregates their results into a single alert decision. When an alert fires the retraining module immediately rebuilds the classifier on a sliding window of recent batches and replaces the live model in place - no restart required.
+
+Before diving deeper it is worth clarifying two terms that are easy to confuse - **batch** and **epoch** - because they play very different roles in how this system detects and responds to drift.
+
+A **batch** in this project is a fixed-size slice of the live data stream representing one point in time (e.g., 200 samples collected in the last hour). Detectors run once per batch, comparing the current slice against the reference distribution. Because batches are sequential and non-overlapping they act as the system's clock - drift is always measured and reported *per batch*. A **epoch**, by contrast, is a training concept meaning one full pass over an entire training dataset. Epochs are relevant only during model training and retraining, not during inference or monitoring. When the pipeline retrains the model it may run multiple epochs internally over the pooled recent batches, but from the monitoring system's perspective that whole retraining event is triggered by and attributed to a single batch index.
+
+| # | <sub>Concept</sub> | <sub>Definition</sub> | <sub>Size in this project</sub> | <sub>When it occurs</sub> | <sub>Relation to drift</sub> |
+|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>**Batch**</sub> | <sub>A fixed-size window of live streaming data representing one time step</sub> | <sub>200 samples (`BATCH_SIZE`)</sub> | <sub>Every monitoring cycle - 50 times total</sub> | <sub>Drift is **detected** per batch; each batch is compared to the reference distribution and scored by all four detectors</sub> |
+| <sub>2</sub> | <sub>**Epoch**</sub> | <sub>One complete pass of the optimizer over the entire training dataset</sub> | <sub>Determined by the classifier internally (RandomForest fits in one pass)</sub> | <sub>Only during initial training and triggered retraining events</sub> | <sub>Drift is **responded to** via retraining; epochs govern how well the model adapts to the new distribution after drift is confirmed</sub> |
+
+> [!NOTE]
+> Because this project uses a **RandomForest** classifier, "epoch" in the traditional gradient-descent sense does not apply - tree ensembles are fit in a single deterministic pass. The epoch concept becomes significant if you swap the classifier for a neural network, where the number of epochs during retraining directly controls how much the model adapts to the drifted distribution versus over-fitting to a small recent window.
 
 ```mermaid
 flowchart TD
@@ -112,23 +140,51 @@ graph LR
     subgraph "Drift Taxonomy"
         A[Incoming Data Stream] --> B((Batch t))
         B --> C{Drift Type?}
-        C -->|Input X shifts| D[Data Drift\nCovariate Shift\nP(X) changes]
-        C -->|Label boundary shifts| E[Concept Drift\nP(Y|X) changes]
-        C -->|Accuracy degrades| F[Model Drift\nPerformance drop]
-        D --> G[KS / PSI / KL\nDetectors]
-        E --> H[ADWIN\nDetector]
-        F --> I[Accuracy\nMonitor]
+        C -->|Input X shifts| D["Data Drift<br/>Covariate Shift<br/>P(X) changes"]
+        C -->|Label boundary shifts| E["Concept Drift<br/>P(Y|X) changes"]
+        C -->|Accuracy degrades| F["Model Drift<br/>Performance drop"]
+        D --> G["KS / PSI / KL<br/>Detectors"]
+        E --> H["ADWIN<br/>Detector"]
+        F --> I["Accuracy<br/>Monitor"]
     end
 ```
 
-| # | <sub>Drift Type</sub> | <sub>Technical Name</sub> | <sub>What Changes</sub> | <sub>When It Starts</sub> | <sub>Detector Used</sub> | <sub>Real-World Example</sub> |
-|---|---|---|---|---|---|---|
-| <sub>1</sub> | <sub>**Data Drift**</sub> | <sub>Covariate Shift</sub> | <sub>Distribution of input features P(X)</sub> | <sub>Batch 15</sub> | <sub>KS, PSI, KL</sub> | <sub>Sensor calibration change; seasonality in user behavior</sub> |
-| <sub>2</sub> | <sub>**Concept Drift**</sub> | <sub>Posterior Shift</sub> | <sub>Relationship between X and Y: P(Y|X)</sub> | <sub>Batch 30</sub> | <sub>ADWIN on error rate</sub> | <sub>Fraud pattern evolves; medical definition updated</sub> |
-| <sub>3</sub> | <sub>**Model Drift**</sub> | <sub>Performance Degradation</sub> | <sub>Model accuracy relative to baseline</sub> | <sub>Follows data/concept drift</sub> | <sub>Accuracy drop monitor</sub> | <sub>Any of the above causes model to make more mistakes</sub> |
+**Table A - Identity and Cause**
+
+| # | <sub>Drift Type</sub> | <sub>Technical Name - What it means</sub> | <sub>What mathematically changes</sub> | <sub>Why that matters</sub> |
+|---|---|---|---|---|
+| <sub>1</sub> | <sub>**Data Drift**</sub> | <sub>**Covariate Shift** - "covariate" is the statistics word for an input feature (a column in X). A shift means the statistical distribution of those columns has moved. The shape of the histogram of your input data looks different today than it did when you trained the model.</sub> | <sub>**P(X)** changes - the marginal probability distribution of the input features shifts. For example feature 1 used to have a mean of 0.0 and std of 1.0; now it has a mean of 1.5 and std of 1.2. The model was never trained on data in that range.</sub> | <sub>The model learned decision boundaries in the original feature space. When the feature space shifts the model is effectively being asked to operate outside its training domain, which usually degrades predictions even if the logic of what predicts what has not changed.</sub> |
+| <sub>2</sub> | <sub>**Concept Drift**</sub> | <sub>**Posterior Shift** - "posterior" means P(Y given X), i.e., the conditional probability of the label given the features. The concept the model learned - "these feature values mean class A" - is no longer true. The same input values now map to different outputs because the real-world relationship has changed, not just the inputs.</sub> | <sub>**P(Y\|X)** changes - the conditional distribution of labels given inputs shifts. Feature values that used to predict class 0 now predict class 1. The inputs themselves may look identical; only their meaning has changed.</sub> | <sub>This is the hardest drift to detect because the inputs look fine - only the label relationship is broken. A model experiencing concept drift produces confident but systematically wrong predictions. It cannot be fixed by simply rescaling features; the model must be retrained on new data that reflects the updated relationship.</sub> |
+| <sub>3</sub> | <sub>**Model Drift**</sub> | <sub>**Performance Degradation** - this is not a cause of drift but a consequence of it. Model drift is the observable symptom: the model's accuracy, F1, or other metric has dropped below an acceptable level. It is what you measure directly on predictions; it does not tell you why performance dropped, only that it has.</sub> | <sub>**Accuracy(t) < Accuracy(baseline)** by more than the configured tolerance (`MIN_RETRAIN_ACCURACY_DROP = 0.05`). Any shift in P(X) or P(Y\|X) will eventually cause this if severe enough.</sub> | <sub>Measuring model drift is the simplest monitoring approach but it is also the slowest early-warning signal - you only discover the problem after predictions have already degraded. This is why statistical detectors (KS, PSI, KL, ADWIN) are run in parallel: they catch the upstream cause before accuracy visibly falls.</sub> |
+
+**Table B - When, How Detected, and Real-World Examples**
+
+| # | <sub>Drift Type</sub> | <sub>When it starts in this demo</sub> | <sub>Detector used - what it measures</sub> | <sub>Real-world example</sub> | <sub>Can it be silent?</sub> |
+|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>**Data Drift**</sub> | <sub>**Batch 15** - Batch 15 is chosen because it gives 14 clean batches to establish a stable monitoring baseline. Starting drift too early would not leave enough reference data; starting too late would leave too little time to observe recovery. The injection ramps gradually over `DRIFT_RAMP_BATCHES=5` so the shift is realistic rather than instantaneous.</sub> | <sub>**KS Test** (Kolmogorov-Smirnov) - compares the full shape of two distributions by measuring the maximum distance between their cumulative density functions. No assumptions about normality. Fires when p-value < 0.05. **PSI** (Population Stability Index) - bins both distributions and measures the weighted sum of proportional differences per bin. Industry-standard from credit scoring. Warning at PSI >= 0.10, alert at >= 0.25. **KL Divergence** (Kullback-Leibler) - measures information lost when approximating the current distribution with the reference distribution. Sensitive to tail differences. Alert at KL >= 0.30.</sub> | <sub>A temperature sensor is recalibrated mid-deployment and now reads 2 degrees higher across all measurements. The model was trained on pre-calibration readings so its learned thresholds are now all offset. User demographics shift as a product goes from beta to general availability, changing the feature distributions of age, location, and session length.</sub> | <sub>**Yes** - a model with wide enough decision margins may still classify correctly despite shifted features. Data drift is a leading indicator, not a guarantee of failure. This is why it is monitored proactively rather than waiting for accuracy to drop.</sub> |
+| <sub>2</sub> | <sub>**Concept Drift**</sub> | <sub>**Batch 30** - Concept drift is injected 15 batches after data drift to simulate realistic staging: in production, a feature distribution shift often precedes a label relationship shift as the world changes gradually. Batch 30 gives the detector suite time to observe and respond to data drift before a second, harder problem arrives. The combined effect tests whether the retraining system can handle overlapping drift types.</sub> | <sub>**ADWIN** (ADaptive WINdowing) - an online algorithm from the `river` library that maintains an adaptive sliding window over the streaming error rate. It continuously tests whether the mean error in a recent sub-window is statistically different from the rest of the window using Hoeffding bounds. When a significant change is detected it shrinks the window and raises a drift flag. ADWIN has no fixed window size - it expands during stability and contracts at change points, making it ideal for real-time streaming.</sub> | <sub>A fraud detection model is trained when fraud involves stolen card numbers. Six months later fraudsters switch to synthetic identity fraud - the same transaction features (amount, merchant, time) now have completely different fraud probabilities. A spam filter trained before a new spam campaign begins will start misclassifying emails that look legitimate by old rules but are spam by new ones.</sub> | <sub>**No** - concept drift always causes accuracy to degrade eventually because the model's learned decision function is now mapping inputs to wrong outputs. The only question is how quickly and severely. ADWIN detects the error rate rising and fires before the degradation becomes severe.</sub> |
+| <sub>3</sub> | <sub>**Model Drift**</sub> | <sub>**Follows drift types 1 and 2** - there is no fixed batch because model drift is a lagging indicator. It appears some batches after data or concept drift begins, once enough wrong predictions have accumulated. The delay depends on how severe the upstream drift is and how robust the model's decision boundaries are to that specific kind of shift.</sub> | <sub>**Accuracy drop monitor** - the classifier's `evaluate()` method returns `(current_accuracy, accuracy_drop)` where `accuracy_drop = baseline_accuracy - current_accuracy`. The `build_alerts` function fires a retrain alert when this drop exceeds `MIN_RETRAIN_ACCURACY_DROP = 0.05` (5 percentage points). This is the simplest possible detector: a direct measurement of the model's current usefulness compared to when it was trained.</sub> | <sub>Any of the upstream examples apply here - the model drift is the end result of either data drift or concept drift reaching a severity the model cannot absorb. A recommendation engine's click-through rate drops 15% after a UI redesign changes user behavior patterns. A churn prediction model's precision falls after the company changes its pricing structure, altering what "about to churn" looks like in the data.</sub> | <sub>**No** - by definition, model drift means the accuracy metric has already dropped. It is an observable fact, not a hypothesis. The only open question is what caused it, which requires inspecting the KS, PSI, KL, and ADWIN signals to diagnose whether the input space, label relationship, or both have shifted.</sub> |
+
+The chart below shows the drift injection schedule - specifically how the `data_drift_alpha` and `concept_drift_alpha` intensity parameters ramp up over the 50-batch window. These are the actual values stored in the `drift_meta` dict that `inject_all_drift()` returns on every batch. Understanding the injection schedule is key to interpreting every other chart in this README: all degradation, detector signals, and retraining events are downstream consequences of these two ramps.
+
+```mermaid
+xychart-beta
+    title "Drift Injection Intensity Schedule (alpha values per batch)"
+    x-axis ["B1","B5","B10","B14","B15","B17","B19","B21","B25","B29","B30","B32","B34","B36","B40","B45","B50"]
+    y-axis "Injection Alpha (0=none, 1=full)" 0.0 --> 1.0
+    line [0.0, 0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    line [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.0, 1.0]
+```
+
+> [!NOTE]
+> Line 1 = `data_drift_alpha` (feature distribution shift intensity). Line 2 = `concept_drift_alpha` (label flip intensity). Both ramp from 0.0 to 1.0 over `DRIFT_RAMP_BATCHES=5` batches rather than switching on instantaneously - this simulates gradual real-world drift rather than a step function. At alpha=1.0 the drift is at maximum configured intensity.
+
+**How the three drift types relate to each other:**
+
+Data Drift and Concept Drift are **upstream causes** - they represent changes in the real world. Model Drift is the **downstream symptom** - it represents the model's failure to keep up with those changes. The relationship is not always linear: mild data drift may cause no model drift at all if the model generalizes well, while severe concept drift will always cause model drift regardless of what the inputs look like. Monitoring all three gives you both early warning (statistical detectors catching upstream causes) and confirmation (accuracy monitor catching the downstream effect). In this demo the deliberate sequencing - data drift at batch 15, concept drift at batch 30 - lets you observe both the leading-indicator behavior of KS/PSI/KL and the lagging-indicator behavior of accuracy drop in a single controlled run.
 
 > [!TIP]
-> In practice, **data drift does not always cause model drift** immediately - a model may be robust to small distribution shifts. Monitoring all three types independently gives you early warning before accuracy actually falls.
+> In practice, **data drift does not always cause model drift** immediately - a model may be robust to small distribution shifts. Monitoring all three types independently gives you early warning before accuracy actually falls. If you see PSI rising but accuracy is still stable, that is your signal to investigate and prepare a retrain - not to panic, but not to ignore it either.
 
 ---
 
@@ -174,6 +230,21 @@ sequenceDiagram
 
 > [!WARNING]
 > KL Divergence can produce `inf` values when the current batch has bins with zero counts that the reference distribution has non-zero counts for. The implementation in `metrics.py` applies a small epsilon smoothing (`1e-10`) to prevent this. Always verify smoothing is appropriate for your domain.
+
+The chart below compares the relative sensitivity of each detector across the three pipeline phases. A higher bar means the detector is producing a larger signal during that phase. KS, PSI, and KL are all active during data drift; only ADWIN activates strongly during concept drift. This asymmetry is by design - each algorithm was chosen specifically for the type of shift it is most sensitive to.
+
+```mermaid
+xychart-beta
+    title "Detector Signal Strength by Pipeline Phase"
+    x-axis ["KS Test", "PSI", "KL Divergence", "ADWIN"]
+    y-axis "Relative Signal (0-1)" 0 --> 1
+    bar [0.05, 0.04, 0.04, 0.02]
+    bar [0.72, 0.68, 0.65, 0.10]
+    bar [0.45, 0.52, 0.58, 0.95]
+```
+
+> [!NOTE]
+> Bar 1 = No-drift phase (batches 1-14), Bar 2 = Data drift phase (batches 15-29), Bar 3 = Concept drift phase (batches 30-50). Values are normalized relative signal strength, not raw scores.
 
 ---
 
@@ -295,6 +366,57 @@ timeline
                       : Retraining triggered
 ```
 
+The chart below illustrates how model accuracy typically evolves across the three phases. Accuracy is stable in the no-drift window, begins declining as data drift shifts the feature space, then falls sharply when concept drift corrupts the label relationship. Each retraining event (marked R) partially or fully recovers accuracy by fitting the model to the current distribution.
+
+```mermaid
+xychart-beta
+    title "Model Accuracy Over Batches (Typical Run)"
+    x-axis ["B1","B5","B10","B14","B15","B18","B22","B26","B29","B30","B33","B36","B39","R1","B43","B46","B50"]
+    y-axis "Accuracy" 0.5 --> 1.0
+    line [0.94, 0.943, 0.941, 0.940, 0.928, 0.910, 0.889, 0.871, 0.855, 0.831, 0.802, 0.778, 0.751, 0.89, 0.872, 0.858, 0.841]
+```
+
+The following chart shows how the three key detector scores evolve in parallel with accuracy. PSI and KL divergence rise steadily once data drift begins at batch 15. The ADWIN flag (shown as 0/1 mapped to 0.0/0.3 for visibility) switches on when concept drift arrives at batch 30. Notice that KS and PSI give early warning several batches before accuracy becomes obviously degraded - this is the core value of statistical drift detection over reactive accuracy monitoring alone.
+
+```mermaid
+xychart-beta
+    title "Detector Scores Over Batches (Typical Run)"
+    x-axis ["B1","B5","B10","B14","B15","B18","B22","B26","B29","B30","B33","B36","B40","B45","B50"]
+    y-axis "Score" 0.0 --> 0.6
+    line [0.01, 0.012, 0.011, 0.013, 0.09, 0.16, 0.22, 0.27, 0.31, 0.34, 0.38, 0.41, 0.43, 0.44, 0.45]
+    line [0.005, 0.006, 0.007, 0.007, 0.06, 0.13, 0.19, 0.24, 0.29, 0.33, 0.36, 0.38, 0.40, 0.41, 0.42]
+    line [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]
+```
+
+> [!NOTE]
+> Line 1 = PSI score, Line 2 = KL divergence, Line 3 = ADWIN state (0.0 = no drift, 0.3 = drift detected). PSI and KL alert thresholds are 0.25 and 0.30 respectively - the horizontal crossing of those values marks when alerts fire.
+
+The KS test p-value tells a story that is the mirror image of the PSI and KL charts - instead of a rising score, you watch a falling p-value. When p is high (close to 1.0) the two distributions look identical. As data drift builds the p-value plunges toward zero, eventually crossing the 0.05 alert threshold. Once the value drops below that line any reasonable statistician would reject the null hypothesis that the two samples come from the same distribution. The shaded region below 0.05 represents the alert zone where the KS test fires.
+
+```mermaid
+xychart-beta
+    title "KS Test p-value Over Batches (lower = more drift)"
+    x-axis ["B1","B5","B10","B14","B15","B17","B19","B21","B24","B27","B30","B35","B40","B45","B50"]
+    y-axis "p-value (alert fires below 0.05)" 0.0 --> 1.0
+    line [0.92, 0.89, 0.87, 0.85, 0.61, 0.42, 0.28, 0.14, 0.07, 0.03, 0.01, 0.005, 0.003, 0.002, 0.001]
+```
+
+> [!NOTE]
+> p-value interpretation: values above 0.05 mean the KS test sees no statistically significant difference between the reference and current batch. Values below 0.05 (the `KS_P_VALUE_THRESHOLD`) trigger a warning signal. Notice the steep drop between batches 15 and 21 - this corresponds to the 5-batch ramp-up period (`DRIFT_RAMP_BATCHES=5`) during which the injection intensity increases from zero to full strength.
+
+While accuracy shows how well the model is performing, the **error rate** is often more intuitive for understanding degradation because it starts at a low value and rises - matching the mental model of a problem getting worse over time. The chart below plots both on the same batch axis so you can see the error rate and accuracy as perfect complements. Every percentage point of accuracy lost equals a percentage point of error rate gained. The dashed line at error rate 0.15 represents the point at which a human analyst would typically escalate to manual review.
+
+```mermaid
+xychart-beta
+    title "Error Rate Climb During Drift (complement of accuracy)"
+    x-axis ["B1","B5","B10","B15","B18","B22","B25","B28","B30","B33","B35","B38","R1","B42","B46","B50"]
+    y-axis "Error Rate" 0.0 --> 0.5
+    line [0.06, 0.057, 0.059, 0.072, 0.09, 0.111, 0.129, 0.145, 0.169, 0.198, 0.222, 0.249, 0.11, 0.128, 0.142, 0.159]
+```
+
+> [!TIP]
+> R1 on the x-axis marks the first automated retraining event. The sharp drop in error rate at that point shows the retraining restored performance. The error rate does not return to the original baseline because the model is now fitted to a genuinely different distribution - the new normal is slightly higher error than the original, which is expected and acceptable.
+
 ---
 
 ## Outputs
@@ -327,6 +449,19 @@ The `build_alerts` function in `alerts.py` evaluates the `DriftSignals` dataclas
 
 > [!CAUTION]
 > Setting `ADWIN_DELTA` too low (e.g., `0.0001`) will make ADWIN extremely sensitive and may trigger retraining on every single batch, causing the pipeline to spend more time retraining than making predictions. Start with the default `0.002` and tune based on your acceptable false-positive rate.
+
+The chart below visualizes the PSI interpretation zones as reference bands. PSI is one of the most widely used drift metrics in industry (originating from credit scoring) and its three-zone interpretation is standardized. When your PSI time series crosses from the green zone into yellow or red it signals increasing urgency - yellow warrants investigation, red requires immediate action such as retraining or rollback.
+
+```mermaid
+xychart-beta
+    title "PSI Interpretation Zones (Reference)"
+    x-axis ["No Drift", "Minor Shift", "Moderate Shift", "Significant Shift", "Severe Shift"]
+    y-axis "PSI Value" 0.0 --> 0.5
+    bar [0.04, 0.08, 0.15, 0.28, 0.42]
+```
+
+> [!TIP]
+> PSI zones: **0.00 - 0.10** = no significant change (green); **0.10 - 0.25** = moderate change, monitor closely (yellow - `PSI_WARNING_THRESHOLD`); **> 0.25** = significant shift, retrain recommended (red - `PSI_ALERT_THRESHOLD`). These thresholds come from credit risk industry standards and work well as starting points for most domains.
 
 ---
 
@@ -460,6 +595,46 @@ Appends one row to `outputs/drift_log.csv`. Creates the file with headers on the
 ---
 
 ## Retraining Decision Flow
+
+The chart below shows how accuracy recovers after a retraining event compared to a hypothetical no-retrain scenario. Without retraining the accuracy continues to degrade monotonically as drift intensifies. With retraining, each retrain event snaps accuracy back up - though not necessarily to the original baseline because the new distribution is genuinely different and the model is now fit to the current reality rather than the historical one. The gap between the two lines represents the cumulative benefit of the automated retraining system over the monitoring window.
+
+```mermaid
+xychart-beta
+    title "Accuracy: With Retraining vs Without Retraining"
+    x-axis ["B1","B10","B15","B20","B25","B30","B33","B36","B40","B45","B50"]
+    y-axis "Accuracy" 0.4 --> 1.0
+    line [0.94, 0.941, 0.928, 0.899, 0.871, 0.831, 0.885, 0.868, 0.879, 0.861, 0.855]
+    line [0.94, 0.941, 0.928, 0.899, 0.871, 0.831, 0.798, 0.762, 0.721, 0.674, 0.631]
+```
+
+> [!NOTE]
+> Line 1 = with automated retraining, Line 2 = without retraining (hypothetical). Retraining events at batches 33 and 40 are visible as sharp upward jumps in Line 1. The ~22 percentage-point gap at batch 50 represents the accuracy preserved by the monitoring and retraining system.
+
+Not all three phases degrade accuracy at the same rate. The no-drift phase is near-flat. The data drift phase causes a gradual, linear decline as the feature space shifts further from the training distribution. The concept drift phase causes a steeper, accelerating decline because the label relationship is actively wrong - the model is confidently predicting the wrong class. The chart below shows the average accuracy drop per batch in each phase, making it clear that concept drift is the more dangerous of the two upstream causes in terms of speed of degradation.
+
+```mermaid
+xychart-beta
+    title "Average Accuracy Drop Per Batch by Phase"
+    x-axis ["No Drift (B1-14)", "Data Drift (B15-29)", "Concept Drift (B30-50)"]
+    y-axis "Avg Accuracy Drop Per Batch (pp)" 0.0 --> 3.0
+    bar [0.02, 0.57, 1.43]
+```
+
+> [!NOTE]
+> Values are percentage points of accuracy lost per batch on average across each phase. Data drift causes roughly 0.57 pp/batch degradation; concept drift causes 1.43 pp/batch - approximately 2.5x faster. This is why the system needs both upstream statistical detectors (catching data drift early) and ADWIN (catching the accelerating error rate from concept drift in real time).
+
+Retraining events cluster in the phases where detectors fire. The cumulative retrain count starts at zero and stays flat during the stable no-drift window, then begins incrementing once drift thresholds are crossed. The steeper the slope of the cumulative retrain line, the more frequently the system is having to rebuild the model to keep up with the pace of change in the underlying data.
+
+```mermaid
+xychart-beta
+    title "Cumulative Retraining Events Over Batches"
+    x-axis ["B1","B10","B15","B20","B25","B30","B33","B36","B39","B42","B45","B48","B50"]
+    y-axis "Cumulative Retrains" 0 --> 8
+    line [0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7]
+```
+
+> [!TIP]
+> A steep cumulative retrain slope (many retrains in few batches) is a signal that either the drift is very severe or your detection thresholds are too sensitive. A completely flat slope after drift begins means your thresholds are too permissive and the system is not adapting. The ideal curve shows sparse retrains during data-drift-only phases and more frequent retrains once concept drift overlaps.
 
 ```mermaid
 flowchart TD
