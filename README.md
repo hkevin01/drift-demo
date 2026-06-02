@@ -27,7 +27,60 @@ The codebase is organized as a production-style pipeline with clearly separated 
 
 ---
 
-## Table of Contents
+## How the Whole Thing Works - Plain English
+
+Before reading any of the technical detail below, here is the complete pipeline explained as a plain sequence of ideas. Everything else in this README is just the detailed mechanics of these six steps.
+
+**Step 1 - You train a model on a snapshot of the world**
+
+You have historical labeled data - say, 2,000 rows of sensor readings where each row is already labeled "normal" or "anomaly." You train a RandomForest classifier on that data. The model learns patterns: "when feature 3 is above 1.4 and feature 7 is below 0.2, that tends to be an anomaly." Those learned patterns are now frozen inside the model's decision trees. This snapshot of the world is called the **reference distribution** - it is the model's entire understanding of reality, and it never changes unless you explicitly retrain.
+
+**Step 2 - New data keeps arriving, but the world is not frozen**
+
+In production, new data arrives continuously - maybe 200 new rows every hour. The problem is that the real world changes over time. Sensors drift, user behavior shifts, fraud patterns evolve, definitions change. The data arriving today may not look like the data the model was trained on. The model has no way to know this on its own - it will keep making predictions confidently even when the data no longer resembles what it learned from.
+
+**Step 3 - You compare each new batch of data to the original snapshot**
+
+This is the core idea. Every time a new batch of 200 rows arrives you run three mathematical comparisons between that batch and the original 2,000 training rows:
+
+- **KS test** asks: do these two sets of numbers come from the same shaped distribution? It computes a p-value. A p-value close to 1.0 means "yes, they look the same." A p-value close to 0.0 means "these look like they came from completely different populations." This is a **probability score** - specifically the probability that the observed difference between the two distributions is just random noise rather than real change.
+- **PSI** asks: if I divide the training data into 10 equal buckets, do the new arrivals fall into those buckets in roughly the same proportions? It produces a score where 0 = identical proportions and larger numbers = bigger mismatch.
+- **KL divergence** asks: if I had to encode this new batch using the training distribution as my codebook, how much information would I waste? Again, 0 = no waste, larger = more mismatch.
+
+None of these are measuring the model's predictions yet. They are measuring the **input data itself** - asking whether what is coming in now looks like what came in during training.
+
+**Step 4 - You also watch whether the model's predictions are getting worse**
+
+In parallel with the statistical comparisons, you run the model on every batch and measure its accuracy. If you have ground-truth labels for the new data you can calculate `accuracy_drop = original_accuracy - current_accuracy`. You also feed the error rate (1 - accuracy) into ADWIN, which watches for a statistically significant step-change in how often the model is wrong. ADWIN is specifically looking for the moment the error rate jumps to a new, persistently higher level rather than just random fluctuation.
+
+**Step 5 - When enough of those scores look bad you retrain**
+
+The system does not retrain on the first hint of a problem because statistical noise can cause occasional bad-looking scores even when nothing has changed. The retrain trigger requires either: the model's accuracy has measurably dropped by more than 5 percentage points, or both the input distribution scores AND the error rate are signaling drift at the same time. When that combined condition is met the system takes the last 5 batches of actual recent data (1,000 rows total), throws away the old model entirely, and trains a brand new model on those 1,000 rows. The new model now knows the current distribution of the world, not the historical one.
+
+**Step 6 - The next batch is already being evaluated by the new model**
+
+Retraining happens synchronously inside the batch loop. There is no restart, no downtime, no separate retraining job. The moment `clf.train()` returns, the new trees are live. The very next batch is scored by the new model. If retraining worked you will see accuracy bounce back on the next output line. If the world has drifted so severely that even 1,000 recent rows are not enough to recover, the system will detect that on subsequent batches and retrain again.
+
+```mermaid
+flowchart TD
+    A["Step 1 - Train on 2,000 historical rows\nReference snapshot frozen"] --> B
+    B["Step 2 - 200 new rows arrive\nWorld may have changed"] --> C
+    C["Step 3 - Compare new batch to reference\nKS p-value · PSI score · KL divergence"] --> D
+    D["Step 4 - Run model on new batch\nMeasure accuracy drop · Feed error rate to ADWIN"] --> E
+    E{"Step 5 - Are scores bad enough?"}
+    E -->|"No - noise or minor shift\nKeep monitoring"| B
+    E -->|"Yes - accuracy drop ≥ 5pp\nOR distribution + error both alerting"| F
+    F["Step 6 - Pool last 5 batches (1,000 rows)\nDiscard old model · Train new model\nNew baseline accuracy set"] --> G
+    G["Next batch evaluated by new model\nAccuracy should recover"] --> B
+```
+
+> [!NOTE]
+> The three statistical scores (KS p-value, PSI, KL) are measuring the **input data**, not the predictions. ADWIN and accuracy drop are measuring the **predictions**. You need both because input drift does not always hurt predictions immediately, and prediction degradation does not always come with visible input drift (concept drift). Monitoring both layers means you get an early warning from the inputs before accuracy falls, and you get a confirmation signal from the predictions that the drift is actually causing harm.
+
+> [!TIP]
+> A useful mental model: think of the reference distribution as a photograph of the world taken on training day. The statistical detectors are asking "does today look like the photo?" The accuracy monitor is asking "is the model confused today?" Both questions matter independently. A model can be confused without the world looking different (concept drift), and the world can look different without the model being confused (robust generalization). You need both sensors to know which situation you are in.
+
+---
 
 - [Architecture](#architecture)
 - [Tech Stack](#tech-stack)
@@ -120,7 +173,38 @@ Because ADWIN operates on prediction error rather than feature distributions, it
 
 ### How detection becomes correction - the full loop
 
-Once all four detectors have run on a batch, `signals_to_dict()` flattens the `DriftSignals` dataclass into a plain dictionary and `build_alerts()` in `alerts.py` evaluates the trigger policy. The policy is: retrain if `model_alert OR (data_alert AND concept_alert)`. A model alert fires when `accuracy_drop >= 0.05`. This means a single statistical detector firing is not enough to trigger retraining on its own - either the model must have measurably degraded, or both the input distribution AND the error rate must show drift simultaneously. This two-factor requirement prevents over-retraining on noise.
+Once all four detectors have run on a batch, `signals_to_dict()` flattens the `DriftSignals` dataclass into a plain dictionary. That dictionary has exactly 8 keys - 4 raw numeric scores and 4 boolean summary flags derived from those scores. Every key is written to one column of `drift_log.csv` for that batch row, which is how the entire metrics time series is built up over the 50 batches.
+
+| # | <sub>Key</sub> | <sub>Type</sub> | <sub>Source detector</sub> | <sub>What it holds</sub> | <sub>Healthy value</sub> | <sub>Alert value</sub> |
+|---|---|---|---|---|---|---|
+| <sub>1</sub> | <sub>`ks_stat`</sub> | <sub>float</sub> | <sub>KS Test</sub> | <sub>The maximum vertical gap between the reference CDF and the current batch CDF. A pure distance measure with no threshold built in - used for logging and trend analysis.</sub> | <sub>Near 0.0 - CDFs track closely</sub> | <sub>Approaching 1.0 - CDFs have diverged</sub> |
+| <sub>2</sub> | <sub>`ks_pvalue`</sub> | <sub>float</sub> | <sub>KS Test</sub> | <sub>The probability that the observed CDF gap is just random sampling noise. This is the value that `build_alerts` compares against the threshold. Fires when it drops below `KS_P_VALUE_THRESHOLD = 0.05`.</sub> | <sub>Above 0.05 - no significant difference detected</sub> | <sub>Below 0.05 - distributions statistically different</sub> |
+| <sub>3</sub> | <sub>`psi`</sub> | <sub>float</sub> | <sub>PSI Calculator</sub> | <sub>Population Stability Index - the weighted sum of proportional bin differences between reference and current. Computed in `metrics.py` using 10 quantile bins derived from the reference distribution.</sub> | <sub>Below 0.10 - no significant population change</sub> | <sub>Above 0.25 (`PSI_ALERT_THRESHOLD`) - significant shift</sub> |
+| <sub>4</sub> | <sub>`kl_div`</sub> | <sub>float</sub> | <sub>KL Divergence</sub> | <sub>KL divergence of the reference distribution from the current batch, computed over 20 uniform histogram bins with epsilon smoothing. Measures information lost when encoding current data using the reference model.</sub> | <sub>Near 0.0 - distributions carry the same information</sub> | <sub>Above 0.30 (`KL_ALERT_THRESHOLD`) - meaningful divergence</sub> |
+| <sub>5</sub> | <sub>`adwin_drift`</sub> | <sub>bool</sub> | <sub>ADWIN</sub> | <sub>Whether the ADWIN adaptive windowing algorithm detected a statistically significant change in the mean error rate since the last change point. `True` means a concept drift regime change has been confirmed.</sub> | <sub>`False` - error rate is statistically stable</sub> | <sub>`True` - error rate has jumped to a new persistent level</sub> |
+| <sub>6</sub> | <sub>`data_drift_detected`</sub> | <sub>bool</sub> | <sub>Derived from keys 2, 3, 4</sub> | <sub>Summary flag - `True` if **any** of: `ks_pvalue < 0.05`, `psi >= 0.25`, or `kl_div >= 0.30`. This is the single boolean `build_alerts` uses for the data drift arm of the retrain trigger. Aggregates all three statistical tests into one decision.</sub> | <sub>`False`</sub> | <sub>`True`</sub> |
+| <sub>7</sub> | <sub>`concept_drift_detected`</sub> | <sub>bool</sub> | <sub>Derived from key 5</sub> | <sub>Summary flag - directly mirrors `adwin_drift`. Named separately to keep the alert logic readable: `data_drift_detected AND concept_drift_detected` is a clear English-language condition, more readable than `any_stat_test AND adwin_drift`.</sub> | <sub>`False`</sub> | <sub>`True`</sub> |
+| <sub>8</sub> | <sub>`model_drift_detected`</sub> | <sub>bool</sub> | <sub>Derived from accuracy drop</sub> | <sub>Summary flag - `True` if `accuracy_drop > 0.0`, meaning the current batch accuracy is worse than baseline by any amount. This is a softer signal than the `model_alert` in `build_alerts` (which requires a 5 pp drop) - it records any measurable degradation for logging purposes even below the retrain threshold.</sub> | <sub>`False`</sub> | <sub>`True`</sub> |
+
+The dictionary is consumed by two separate downstream steps. `build_alerts()` reads keys 6, 7, and 8 (the boolean summary flags) plus the raw `accuracy_drop` scalar to produce the retrain decision. `log_batch()` in `logger.py` writes all 8 keys as columns in `drift_log.csv` alongside the batch index and metadata notes - this is what powers every chart in the dashboard and the static plots.
+
+> [!NOTE]
+> Keys 6, 7, and 8 are not independent measurements - they are derived summaries computed from keys 1-5 and the accuracy drop. They exist to give `build_alerts()` clean named booleans to reason about rather than forcing it to re-implement threshold comparisons. If you change a threshold in `config.py` the boolean flags automatically reflect the new threshold on the next batch run because they are computed fresh every time `DriftDetectorSuite.detect()` is called.
+
+`build_alerts()` then takes those flags and produces its own separate dictionary with the retrain decision:
+
+```python
+# What build_alerts() returns - the action dictionary
+{
+    "data_alert":    True,   # signals.data_drift_detected
+    "concept_alert": True,   # signals.concept_drift_detected
+    "model_alert":   True,   # accuracy_drop >= MIN_RETRAIN_ACCURACY_DROP (0.05)
+    "retrain":       True,   # model_alert OR (data_alert AND concept_alert)
+    "reason":        "retrain_triggered"   # or "monitor_closely" or "stable"
+}
+```
+
+The `reason` string is the human-readable explanation of why the system took the action it did - `"stable"` means all detectors quiet, `"monitor_closely"` means some detectors firing but retrain threshold not yet met, and `"retrain_triggered"` means the full condition was satisfied. This string is written into the `notes` column of `drift_log.csv` so you can filter the log for retrain events with `df[df.notes.str.contains("retrain_triggered")]`.
 
 When `retrain=True` is returned from `build_alerts`, `main.py` calls `retrain_model(clf, list(history), window=RETRAIN_WINDOW)`. The `history` deque holds the last 5 batches as `(X_drifted, y_drifted)` tuples. `build_retrain_set()` in `retrain.py` stacks those 5 batches with `np.vstack` and `np.concatenate`, producing a new training set of up to 1,000 samples (5 batches × 200 samples). `clf.train(X_new, y_new)` then re-fits the RandomForest on this pooled data and updates `clf.baseline_accuracy` to the new post-retrain accuracy. The old model is discarded and the new one takes its place for all subsequent batch evaluations. Nothing else in the pipeline changes - the detectors continue running against the original 2,000-sample reference, not the retrain set.
 
@@ -467,8 +551,89 @@ Batch 16 | acc=0.903 | KS p=0.031 | PSI=0.143 | KL=0.112 | ADWIN=False | retrain
 Batch 31 | acc=0.821 | KS p=0.001 | PSI=0.287 | KL=0.341 | ADWIN=True  | retrain=True
 ```
 
+Each field in that output line is a live reading from one detector or the model. Reading across a single line gives you the complete health picture for that batch in one glance. Here is what each field means and how to read the three example rows above:
+
+- **`acc`** - the model's classification accuracy on the current batch. Batch 01 scores 0.941 (94.1% correct) which is the healthy baseline. By Batch 16 it has dropped to 0.903 and by Batch 31 to 0.821 - an 12-point fall from baseline that indicates the model is struggling with the drifted data.
+- **`KS p`** - the p-value from the Kolmogorov-Smirnov two-sample test comparing the current batch's feature distribution to the training reference. **Higher is safer.** Batch 01 shows 0.812 - an 81% chance the two samples came from the same distribution, so no alarm. Batch 16 shows 0.031 - below the 0.05 alert threshold, meaning the feature distribution is now statistically different from training at 95% confidence. Batch 31 shows 0.001 - the distributions are clearly separated with near certainty.
+- **`PSI`** - Population Stability Index measuring the mismatch in bin proportions between the current batch and the training reference. **Higher means more drift.** Batch 01 shows 0.012, well inside the safe zone (< 0.10). Batch 16 shows 0.143, in the warning zone (0.10 - 0.25) - a yellow flag that warrants monitoring. Batch 31 shows 0.287, above the 0.25 alert threshold - the population has shifted significantly enough that the model's learned boundaries no longer match the incoming data.
+- **`KL`** - KL divergence measuring how many extra "bits" of information are lost when using the training distribution as a model for the current batch. **Higher means more information loss.** Batch 01 shows 0.008 - negligible divergence. Batch 16 shows 0.112 - measurable but below the 0.30 alert threshold. Batch 31 shows 0.341 - above threshold, confirming that the current distribution carries meaningfully different information than the reference.
+- **`ADWIN`** - boolean flag from the ADWIN adaptive windowing algorithm watching the streaming error rate. `False` means error rate is statistically stable in recent batches. `True` at Batch 31 means ADWIN detected a significant step-change in the mean error rate - this is the concept drift signal, telling us the model is not just slightly worse but is experiencing a regime change in how often it is wrong.
+- **`retrain`** - whether the `build_alerts()` trigger policy fired for this batch. `False` on Batch 16 because PSI is in warning territory but ADWIN has not fired yet - data drift alone is not enough to trigger a retrain without also seeing error rate change. `True` on Batch 31 because `model_alert` (accuracy dropped > 5 pp) is `True` AND `concept_alert` (ADWIN fired) is `True` - both conditions met so the retraining response kicks in immediately.
+
+> [!NOTE]
+> Reading the three rows together tells the full drift story in miniature. Batch 01 is the healthy baseline - everything green, model performing well, detectors quiet. Batch 16 is the early warning stage - KS p-value and PSI are flashing yellow but accuracy has only slipped ~4 points and ADWIN has not fired, so the system monitors but does not act yet. Batch 31 is confirmed drift - all four detectors are in alert state simultaneously and the accuracy drop has crossed the 5 pp threshold, so `retrain=True` fires and the model is rebuilt on the last 5 batches before the next batch is processed.
+
+### What retraining actually looks like - from batch output to new model
+
+When `retrain=True` appears on a batch line it is easy to think of it as a simple flag. In practice it represents a complete model replacement happening synchronously inside the same loop iteration that produced that output line - the next batch will be evaluated by a different model than the previous batch was. Here is the exact sequence of events that unfolds between the moment `retrain=True` is set and the moment the next batch line is printed.
+
+**Step 1 - The trigger decision (from the batch output values)**
+
+`build_alerts()` receives the `DriftSignals` dataclass populated from that batch's detector run. At Batch 31 the inputs look like this:
+
+```
+signals.data_drift_detected  = True   # KS p=0.001 < 0.05 AND PSI=0.287 > 0.25
+signals.concept_drift_detected = True  # ADWIN=True
+accuracy_drop = 0.941 - 0.821 = 0.120  # 12 pp drop from original baseline
+model_alert   = True   # 0.120 >= MIN_RETRAIN_ACCURACY_DROP (0.05)
+```
+
+The trigger policy evaluates: `retrain = model_alert OR (data_alert AND concept_alert)` which is `True OR (True AND True)` = `True`. The `alerts` dict is returned with `"retrain": True` and `"reason": "retrain_triggered"`. This reason string is what gets written into the `notes` column of `drift_log.csv` for that batch row alongside all the metric values.
+
+**Step 2 - Building the retraining dataset from the history deque**
+
+`main.py` maintains a `history` deque with `maxlen=RETRAIN_WINDOW` (5). Every batch - whether drift was detected or not - appends its `(X_drifted, y_drifted)` to this deque. At the moment Batch 31 triggers a retrain the deque contains exactly the last 5 batches: batches 27, 28, 29, 30, and 31. Crucially these are the **drifted** versions of the data - the output of `inject_all_drift()` - not the original clean data. This is intentional: the model should learn the current distribution, not the historical one.
+
+`build_retrain_set()` calls `np.vstack([x for x, _ in selected])` to vertically stack the five `(200, 10)` arrays into a single `(1000, 10)` matrix, and `np.concatenate([yy for _, yy in selected])` to join the five 200-element label vectors into a single 1000-element vector. The result is a fresh labeled training set that represents the last 1,000 data points the system has seen.
+
+**Step 3 - Fitting the new model**
+
+`clf.train(X_new, y_new)` is called on the existing `DriftAwareClassifier` instance. Internally this calls `sklearn.ensemble.RandomForestClassifier.fit(X_new, y_new)` which discards all the tree structure learned during the original training on 2,000 samples and rebuilds 200 new trees from scratch using only the 1,000-sample retrain set. The `fit()` call returns immediately once all trees are built. `clf.baseline_accuracy` is then updated to the accuracy measured on the retrain set itself - this becomes the new reference point from which future `accuracy_drop` values are calculated. If the new model scores 0.885 on the retrain set, then Batch 32's `accuracy_drop` will be `0.885 - acc_32`, not `0.941 - acc_32`.
+
+**Step 4 - The model is live for the next batch**
+
+The `retrain_model()` call returns the same `clf` object, now backed by completely different trees. `main.py` does not pause, restart, or signal anything externally - on the very next loop iteration Batch 32 arrives, `clf.evaluate(X_32, y_32)` runs predictions using the new trees, and a new output line is printed. From the console output you will see something like:
+
+```
+Batch 31 | acc=0.821 | KS p=0.001 | PSI=0.287 | KL=0.341 | ADWIN=True  | retrain=True
+Batch 32 | acc=0.889 | KS p=0.001 | PSI=0.281 | KL=0.334 | ADWIN=False | retrain=False
+```
+
+The accuracy jump from 0.821 to 0.889 between those two lines is the visible signature of a successful retrain. The statistical detector scores (KS, PSI, KL) remain high because they compare against the **original training reference** which has not changed - the world is still drifted relative to where training started. ADWIN resets to `False` because its internal window was cleared when drift was detected and it is now accumulating fresh error rate readings from the retrained model.
+
+> [!IMPORTANT]
+> The jump in accuracy after retraining does not mean the model is "back to normal." It means the model has adapted to the current drifted distribution and is now accurate within that distribution. The statistical detector scores staying high is correct and expected - they are measuring "how different is the current world from the training world," which is still very different. A successful retrain does not make the drift go away; it makes the model competent within the drifted regime.
+
+> [!TIP]
+> If you want to trace exactly what data went into a retrain you can add `pd.DataFrame(X_new).describe()` inside `retrain_model()` in `retrain.py` before the `clf.train()` call. This prints the feature statistics of the retrain set to console, letting you compare the retrain distribution directly against the original training distribution statistics you can compute from `get_initial_data()` in `generate_stream.py`.
+
 ```mermaid
-timeline
+sequenceDiagram
+    participant M as main.py loop
+    participant H as history deque
+    participant A as build_alerts()
+    participant R as retrain_model()
+    participant C as DriftAwareClassifier
+    participant L as logger / CSV
+
+    Note over M: Batch 31 arrives
+    M->>H: history.append((X_31, y_31))
+    M->>A: build_alerts(signals, accuracy_drop=0.120)
+    A-->>M: retrain=True, reason="retrain_triggered"
+    M->>R: retrain_model(clf, history[-5:], window=5)
+    R->>R: np.vstack → X_new (1000, 10)
+    R->>R: np.concatenate → y_new (1000,)
+    R->>C: clf.train(X_new, y_new)
+    C->>C: RandomForest.fit() - rebuild all 200 trees
+    C->>C: baseline_accuracy = score(X_new, y_new) = 0.885
+    C-->>R: updated clf
+    R-->>M: same clf instance, new trees
+    M->>L: log_batch(31, metrics, notes="retrain_triggered")
+    Note over M: Batch 32 arrives - evaluated by NEW model
+    M->>C: clf.evaluate(X_32, y_32)
+    C-->>M: acc=0.889, drop=0.885-0.889=-0.004
+    M->>L: log_batch(32, metrics, notes="stable")
+```
     title Drift Demo Pipeline Timeline
     section No Drift
         Batch 01 - 14 : Baseline stable
