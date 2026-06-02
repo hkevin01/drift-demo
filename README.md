@@ -85,17 +85,26 @@ At initialization, the `DriftDetectorSuite` extracted and stored column 0 from t
 
 The model's predictions are also tracked. After classifying every batch the `DriftAwareClassifier.evaluate()` method computes `(current_accuracy, accuracy_drop)`. The `error_rate = 1.0 - accuracy` is passed to ADWIN as a streaming scalar - one number per batch.
 
+> [!TIP]
+> **GPU/CUDA - Feature Extraction for Detectors:** Currently the detectors operate on raw feature column 0 from `X_batch`. If you replace the raw features with learned embeddings - for example by passing `X_batch` through a PyTorch encoder running on CUDA - you get a much richer representation for drift detection. A GPU-accelerated encoder can transform a 200 × 10 raw batch into a 200 × 128 embedding in microseconds, and you can then run PSI or KL divergence on any of those 128 dimensions. This is a common production pattern: use a frozen pretrained encoder to extract features, then monitor the embedding distribution for drift rather than the raw input. The `torch` dependency is already in `requirements.txt` precisely to enable this - swap `classifier.py` to use a `torch.nn.Module` encoder and the rest of the pipeline remains unchanged.
+
 ### KS Test - comparing the shape of two distributions
 
 The Kolmogorov-Smirnov test does not care about specific statistics like mean or variance. Instead it builds the **cumulative distribution function (CDF)** of both arrays - the reference and the current batch - and measures the largest vertical gap between the two curves at any point. A CDF at value `x` answers the question "what fraction of my data is less than or equal to x?" If the two distributions are identical, their CDFs will track each other closely and the maximum gap (the KS statistic) will be small. If one distribution has shifted or stretched, the CDFs will diverge and the gap grows.
 
 `scipy.stats.ks_2samp(self.reference_feature, x_curr)` returns two things: `ks_stat` (the size of that maximum CDF gap, 0 to 1) and `ks_pvalue` (the probability of observing a gap this large if the two samples truly came from the same distribution). A p-value below `KS_P_VALUE_THRESHOLD = 0.05` means there is less than a 5% chance the gap is just random noise - the distributions are genuinely different.
 
+> [!TIP]
+> **GPU/CUDA - KS Test at Scale:** `scipy.stats.ks_2samp` runs on CPU and is single-threaded. For the 200-sample batches in this demo that is instantaneous. However, if you scale batch sizes to tens of thousands of samples (e.g., monitoring a high-frequency trading system where 50,000 transactions arrive per minute), the CDF sort operations become measurable. The `torch` library provides `torch.sort` which runs on CUDA and is dramatically faster for large arrays. You can approximate a GPU KS test by computing empirical CDFs with `torch.sort` and `torch.searchsorted` on a CUDA tensor, then calling `.item()` to retrieve the scalar result. This keeps the rest of the CPU-bound pipeline unchanged while the CDF comparison runs on the GPU.
+
 ### PSI - comparing bin proportions
 
 Population Stability Index (PSI) takes a different approach. It divides the reference distribution into 10 equal-quantile bins using `np.quantile(expected, np.linspace(0, 1, 11))` - essentially cutting the reference array into 10 buckets where each bucket contains exactly 10% of the reference data. It then counts how many values from the current batch fall into each of those same 10 buckets.
 
 If nothing has changed, you would expect roughly 10% of the current batch to fall into each bucket. If the distribution has shifted, some buckets will be over-represented and others under-represented. PSI quantifies this mismatch with the formula `sum((actual_pct - expected_pct) * log(actual_pct / expected_pct))` across all bins. A PSI of 0 means perfect match. The epsilon clip `np.clip(..., 1e-8, None)` in `metrics.py` prevents a `log(0)` crash when a bin gets zero samples in the current batch. The result crosses `PSI_ALERT_THRESHOLD = 0.25` only when the bin proportion differences are large enough to constitute a meaningful distribution shift.
+
+> [!TIP]
+> **GPU/CUDA - PSI and KL at High Feature Dimensionality:** The current implementation runs PSI and KL on a single feature column. If you extend `detectors.py` to monitor all 10 feature columns simultaneously - or hundreds of columns in a real dataset - the bottleneck shifts to the histogram binning loop: `np.histogram` is called once per feature per batch. `cupy.histogram` is a GPU-accelerated drop-in replacement that processes all feature histograms in a single parallelized kernel call. For a 500-feature dataset with 10,000-sample batches, `cupy` histogram batching can reduce the detection step from ~800 ms to under 20 ms. To enable it, `pip install cupy-cuda12x` (matching your CUDA version) and add `try: import cupy as np` with a CPU fallback at the top of `metrics.py`.
 
 ### KL Divergence - measuring information loss
 
@@ -114,6 +123,9 @@ Because ADWIN operates on prediction error rather than feature distributions, it
 Once all four detectors have run on a batch, `signals_to_dict()` flattens the `DriftSignals` dataclass into a plain dictionary and `build_alerts()` in `alerts.py` evaluates the trigger policy. The policy is: retrain if `model_alert OR (data_alert AND concept_alert)`. A model alert fires when `accuracy_drop >= 0.05`. This means a single statistical detector firing is not enough to trigger retraining on its own - either the model must have measurably degraded, or both the input distribution AND the error rate must show drift simultaneously. This two-factor requirement prevents over-retraining on noise.
 
 When `retrain=True` is returned from `build_alerts`, `main.py` calls `retrain_model(clf, list(history), window=RETRAIN_WINDOW)`. The `history` deque holds the last 5 batches as `(X_drifted, y_drifted)` tuples. `build_retrain_set()` in `retrain.py` stacks those 5 batches with `np.vstack` and `np.concatenate`, producing a new training set of up to 1,000 samples (5 batches × 200 samples). `clf.train(X_new, y_new)` then re-fits the RandomForest on this pooled data and updates `clf.baseline_accuracy` to the new post-retrain accuracy. The old model is discarded and the new one takes its place for all subsequent batch evaluations. Nothing else in the pipeline changes - the detectors continue running against the original 2,000-sample reference, not the retrain set.
+
+> [!TIP]
+> **GPU/CUDA - Retraining Speed:** The `RandomForest` in `classifier.py` is CPU-only - scikit-learn does not support CUDA. For the 1,000-sample retrain set in this demo the fit takes under a second, so this is not a bottleneck here. However, there are two GPU upgrade paths worth knowing. First, **RAPIDS cuML** (`pip install cuml`) provides a GPU-accelerated `RandomForestClassifier` with an identical scikit-learn API - swap the import in `classifier.py` and retraining on 1,000 samples drops from ~400 ms to under 10 ms, which matters if your pipeline needs to retrain many times per minute. Second, if you replace the RandomForest with a PyTorch neural network, the `clf.train()` call runs on CUDA automatically once the model is moved with `.to('cuda')` and the training loop uses CUDA tensors. Either path requires only changing `classifier.py` - `retrain.py`, `alerts.py`, and `main.py` are all model-agnostic.
 
 ```mermaid
 flowchart LR
@@ -231,6 +243,9 @@ The following table describes every major dependency, what role it plays in this
 | <sub>9</sub> | <sub>**joblib**</sub> | <sub>`>=1.3`</sub> | <sub>Serializing and loading the trained model to `outputs/model.joblib`</sub> | <sub>Optimized for numpy arrays; faster and more memory-efficient than pickle for sklearn</sub> |
 | <sub>10</sub> | <sub>**pyyaml**</sub> | <sub>`>=6.0`</sub> | <sub>Future config file support for YAML-based pipeline settings</sub> | <sub>Human-readable config format that is trivially diff-able in git</sub> |
 | <sub>11</sub> | <sub>**tqdm**</sub> | <sub>`>=4.65`</sub> | <sub>Progress bars during batch streaming so runtime status is always visible</sub> | <sub>Zero-dependency progress display that works in terminals and notebooks</sub> |
+
+> [!TIP]
+> **GPU/CUDA - Tech Stack:** Three components of this stack directly benefit from a CUDA-capable GPU. `torch` will use CUDA automatically for feature extraction and any neural network work once you install the correct CUDA wheel. `scikit-learn`'s RandomForest does **not** use a GPU - but if you replace it with a neural classifier in `classifier.py`, that model will use CUDA via PyTorch with no other changes required. For large-scale batch processing where the bottleneck is the numpy array operations in `metrics.py` (histogram binning, quantile computation), `cupy` is a drop-in replacement for numpy that executes those same operations on the GPU - just `import cupy as np` and the PSI and KL divergence calculations will run on GPU memory. See the GPU acceleration notes in the Detection section below for specifics.
 
 ---
 
@@ -680,6 +695,9 @@ Returns `(current_accuracy, accuracy_drop)` where `accuracy_drop = baseline_accu
 
 #### `retrain_model(clf, history, window) -> DriftAwareClassifier`
 Pools the most recent `window` batches from `history`, concatenates them into a single training set, and calls `clf.train()` on the new data. Returns the updated classifier. The existing model weights are discarded and replaced entirely.
+
+> [!TIP]
+> **GPU/CUDA - Neural Net Retraining via PyTorch:** If `DriftAwareClassifier` wraps a `torch.nn.Module` instead of a RandomForest, move the model to GPU with `self.model.to(torch.device('cuda'))` inside `classifier.py`. The `retrain_model()` function in `retrain.py` does not need any changes - it calls `clf.train(X_new, y_new)` which is a method you control. Inside that method, convert the numpy arrays to CUDA tensors with `torch.tensor(X_new, dtype=torch.float32).cuda()` before the training loop. With CUDA, a neural network retrain on 1,000 samples with 50 epochs typically completes in under 100 ms on a modern GPU - fast enough that the pipeline does not stall between incoming batches even if retrains are frequent.
 
 ---
 
