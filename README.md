@@ -71,6 +71,109 @@ Before diving deeper it is worth clarifying two terms that are easy to confuse -
 
 A **batch** in this project is a fixed-size slice of the live data stream representing one point in time (e.g., 200 samples collected in the last hour). Detectors run once per batch, comparing the current slice against the reference distribution. Because batches are sequential and non-overlapping they act as the system's clock - drift is always measured and reported *per batch*. A **epoch**, by contrast, is a training concept meaning one full pass over an entire training dataset. Epochs are relevant only during model training and retraining, not during inference or monitoring. When the pipeline retrains the model it may run multiple epochs internally over the pooled recent batches, but from the monitoring system's perspective that whole retraining event is triggered by and attributed to a single batch index.
 
+---
+
+## How Drift Is Actually Detected - What the Algorithms Are Looking For
+
+This is the question at the heart of the whole system. The phrase "detecting drift" sounds abstract, but every algorithm is doing something concrete and measurable. Each one is asking a specific question about specific numbers extracted from the raw data, and comparing those numbers to a stored reference snapshot. Here is exactly what each algorithm looks for, where it finds that information, and how it turns a stream of feature vectors into a yes/no drift signal.
+
+### Where the raw information comes from
+
+Every batch that arrives contains a matrix `X_batch` of shape `(200, 10)` - 200 samples, each with 10 feature columns. The detector suite always works on **column 0** of that matrix, extracting it as a 1D array of 200 float values. Column 0 is used as a representative feature for distribution comparison because using all 10 columns simultaneously would require a multivariate test, which is computationally heavier and harder to interpret. In production you would run the detectors on each feature column independently or use a dimensionality-reduction approach.
+
+At initialization, the `DriftDetectorSuite` extracted and stored column 0 from the original 2,000-sample training set as `self.reference_feature`. This reference array never changes - it is the frozen snapshot of what the world looked like when the model was trained. Every detector then asks some variant of the same question: **"does the 200-value array I have right now look like it was drawn from the same distribution as the 2,000-value reference array?"**
+
+The model's predictions are also tracked. After classifying every batch the `DriftAwareClassifier.evaluate()` method computes `(current_accuracy, accuracy_drop)`. The `error_rate = 1.0 - accuracy` is passed to ADWIN as a streaming scalar - one number per batch.
+
+### KS Test - comparing the shape of two distributions
+
+The Kolmogorov-Smirnov test does not care about specific statistics like mean or variance. Instead it builds the **cumulative distribution function (CDF)** of both arrays - the reference and the current batch - and measures the largest vertical gap between the two curves at any point. A CDF at value `x` answers the question "what fraction of my data is less than or equal to x?" If the two distributions are identical, their CDFs will track each other closely and the maximum gap (the KS statistic) will be small. If one distribution has shifted or stretched, the CDFs will diverge and the gap grows.
+
+`scipy.stats.ks_2samp(self.reference_feature, x_curr)` returns two things: `ks_stat` (the size of that maximum CDF gap, 0 to 1) and `ks_pvalue` (the probability of observing a gap this large if the two samples truly came from the same distribution). A p-value below `KS_P_VALUE_THRESHOLD = 0.05` means there is less than a 5% chance the gap is just random noise - the distributions are genuinely different.
+
+### PSI - comparing bin proportions
+
+Population Stability Index (PSI) takes a different approach. It divides the reference distribution into 10 equal-quantile bins using `np.quantile(expected, np.linspace(0, 1, 11))` - essentially cutting the reference array into 10 buckets where each bucket contains exactly 10% of the reference data. It then counts how many values from the current batch fall into each of those same 10 buckets.
+
+If nothing has changed, you would expect roughly 10% of the current batch to fall into each bucket. If the distribution has shifted, some buckets will be over-represented and others under-represented. PSI quantifies this mismatch with the formula `sum((actual_pct - expected_pct) * log(actual_pct / expected_pct))` across all bins. A PSI of 0 means perfect match. The epsilon clip `np.clip(..., 1e-8, None)` in `metrics.py` prevents a `log(0)` crash when a bin gets zero samples in the current batch. The result crosses `PSI_ALERT_THRESHOLD = 0.25` only when the bin proportion differences are large enough to constitute a meaningful distribution shift.
+
+### KL Divergence - measuring information loss
+
+KL divergence asks a more information-theoretic question: if you used the reference distribution as a model to encode data that is actually coming from the current distribution, how many extra bits of information would you need on average? A small KL value means the current distribution is close enough to the reference that using the reference as a model wastes very little information. A large value means the reference is a poor description of the current data.
+
+In `metrics.py`, both distributions are histogrammed onto the same fixed bin edges spanning `[min(all values), max(all values)]` with 20 bins. The bin counts are converted to probabilities and `scipy.stats.entropy(exp_prob, act_prob)` computes `sum(exp_prob * log(exp_prob / act_prob))` - the KL divergence of the reference from the current. Alert fires when this exceeds `KL_ALERT_THRESHOLD = 0.30`. Unlike PSI which uses quantile-based bins derived from the reference, KL uses uniform-width bins across the full value range, making it more sensitive to tail behavior where extreme values cluster.
+
+### ADWIN - watching the error rate change over time
+
+ADWIN (ADaptive WINdowing) does not look at feature distributions at all. Its input is purely `error_rate = 1.0 - accuracy` - a single number per batch. ADWIN maintains a sliding window of these error rate values and continuously tests whether the mean error in any recent sub-window is statistically different from the mean of the rest of the window, using Hoeffding bounds to determine what counts as statistically significant. When it detects a significant change in mean error it declares drift and shrinks the window to the most recent data, resetting its baseline to the new regime.
+
+Because ADWIN operates on prediction error rather than feature distributions, it detects concept drift - the case where the inputs look normal but the model is suddenly wrong about them. The `river` library's `ADWIN(delta=0.002)` instance is stateful across batches; calling `self._adwin.update(error_rate)` on each batch both feeds new data and checks for drift, with `self._adwin.drift_detected` returning `True` the moment a significant change point is found.
+
+### How detection becomes correction - the full loop
+
+Once all four detectors have run on a batch, `signals_to_dict()` flattens the `DriftSignals` dataclass into a plain dictionary and `build_alerts()` in `alerts.py` evaluates the trigger policy. The policy is: retrain if `model_alert OR (data_alert AND concept_alert)`. A model alert fires when `accuracy_drop >= 0.05`. This means a single statistical detector firing is not enough to trigger retraining on its own - either the model must have measurably degraded, or both the input distribution AND the error rate must show drift simultaneously. This two-factor requirement prevents over-retraining on noise.
+
+When `retrain=True` is returned from `build_alerts`, `main.py` calls `retrain_model(clf, list(history), window=RETRAIN_WINDOW)`. The `history` deque holds the last 5 batches as `(X_drifted, y_drifted)` tuples. `build_retrain_set()` in `retrain.py` stacks those 5 batches with `np.vstack` and `np.concatenate`, producing a new training set of up to 1,000 samples (5 batches × 200 samples). `clf.train(X_new, y_new)` then re-fits the RandomForest on this pooled data and updates `clf.baseline_accuracy` to the new post-retrain accuracy. The old model is discarded and the new one takes its place for all subsequent batch evaluations. Nothing else in the pipeline changes - the detectors continue running against the original 2,000-sample reference, not the retrain set.
+
+```mermaid
+flowchart LR
+    subgraph INPUT["Each Batch: X_batch shape (200, 10)"]
+        C0["Column 0\n200 float values\n(feature sample)"]
+        ACC["error_rate\n1.0 - accuracy\n(scalar per batch)"]
+    end
+
+    subgraph DETECTORS["DriftDetectorSuite.detect()"]
+        REF["reference_feature\n2000-value frozen\ntraining snapshot"]
+        KS["KS Test\nks_2samp(ref, curr)\nMax CDF gap → p-value"]
+        PSI["PSI\n10 quantile bins\nProportion mismatch sum"]
+        KL["KL Divergence\n20 uniform bins\nInformation loss bits"]
+        AW["ADWIN\nHoeffding bounds\non error_rate stream"]
+    end
+
+    subgraph SIGNALS["DriftSignals dataclass"]
+        S1["ks_stat, ks_pvalue"]
+        S2["psi"]
+        S3["kl_div"]
+        S4["adwin_drift bool"]
+        S5["data_drift_detected\nconcept_drift_detected\nmodel_drift_detected"]
+    end
+
+    subgraph ALERT["build_alerts()"]
+        POLICY["retrain = model_alert\nOR (data_alert AND concept_alert)"]
+    end
+
+    subgraph RETRAIN["retrain_model()"]
+        POOL["Pool last 5 batches\nfrom history deque\n→ 1000 samples"]
+        FIT["clf.train(X_new, y_new)\nReplace live model"]
+    end
+
+    C0 --> REF
+    C0 --> KS
+    C0 --> PSI
+    C0 --> KL
+    ACC --> AW
+    REF --> KS
+    REF --> PSI
+
+    KS --> S1
+    PSI --> S2
+    KL --> S3
+    AW --> S4
+    S1 & S2 & S3 & S4 --> S5
+    S5 --> ALERT
+    POLICY -->|retrain=True| POOL
+    POOL --> FIT
+    FIT -->|new clf replaces old| INPUT
+```
+
+> [!IMPORTANT]
+> The detectors always compare against the **original training reference** - they are measuring "how far has the world drifted from when we trained?" not "how much did this batch differ from the last batch." This distinction matters: comparing consecutive batches would flag normal random variation as drift. Comparing against a frozen training snapshot gives a stable absolute baseline.
+
+> [!NOTE]
+> After retraining, `clf.baseline_accuracy` is updated to the post-retrain accuracy on the retrain set. This means subsequent `accuracy_drop` calculations measure degradation from the **new post-retrain baseline**, not the original one. The model effectively resets its performance expectation each time it is retrained, which is correct behavior - the new distribution is the new normal.
+
+---
+
 | # | <sub>Concept</sub> | <sub>Definition</sub> | <sub>Size in this project</sub> | <sub>When it occurs</sub> | <sub>Relation to drift</sub> |
 |---|---|---|---|---|---|
 | <sub>1</sub> | <sub>**Batch**</sub> | <sub>A fixed-size window of live streaming data representing one time step</sub> | <sub>200 samples (`BATCH_SIZE`)</sub> | <sub>Every monitoring cycle - 50 times total</sub> | <sub>Drift is **detected** per batch; each batch is compared to the reference distribution and scored by all four detectors</sub> |
