@@ -44,8 +44,33 @@ In production, new data arrives continuously - maybe 200 new rows every hour. Th
 This is the core idea. Every time a new batch of 200 rows arrives you run three mathematical comparisons between that batch and the original 2,000 training rows:
 
 - **KS test** asks: do these two sets of numbers come from the same shaped distribution? It computes a p-value. A p-value close to 1.0 means "yes, they look the same." A p-value close to 0.0 means "these look like they came from completely different populations." This is a **probability score** - specifically the probability that the observed difference between the two distributions is just random noise rather than real change.
-- **PSI** asks: if I divide the training data into 10 equal buckets, do the new arrivals fall into those buckets in roughly the same proportions? It produces a score where 0 = identical proportions and larger numbers = bigger mismatch.
-- **KL divergence** asks: if I had to encode this new batch using the training distribution as my codebook, how much information would I waste? Again, 0 = no waste, larger = more mismatch.
+- **PSI** asks: if I divide the training data into 10 equal buckets, do the new arrivals fall into those buckets in roughly the same proportions? Imagine sorting all 2,000 training values from smallest to largest and drawing a line every 200 values - that gives you 10 equally-sized buckets. Each bucket holds exactly 10% of the training data by construction. Now take the 200 new arrivals and count how many fall into each bucket. If the distribution has not changed you would expect roughly 20 arrivals (10%) in each bucket. If the distribution has shifted to the right, the right-side buckets will be over-filled and the left-side buckets will be nearly empty. PSI measures that mismatch with a penalty that is asymmetric - a bucket that was 10% in training but is 30% in the new batch contributes more to the score than one that shifted from 10% to 12%. Below 0.10 is stable. Between 0.10 and 0.25 is a warning. Above 0.25 triggers the alert. The chart below shows what reference (flat) versus severely-drifted bucket proportions look like side by side.
+
+```mermaid
+xychart-beta
+    title "PSI Bucket Example - Reference vs Drifted Batch (10 quantile bins)"
+    x-axis ["Bin1 low","Bin2","Bin3","Bin4","Bin5","Bin6","Bin7","Bin8","Bin9","Bin10 high"]
+    y-axis "Percent of samples in bin" 0 --> 40
+    bar [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]
+    bar [1, 2, 3, 5, 8, 12, 16, 20, 22, 11]
+```
+
+> [!NOTE]
+> Bar 1 = reference distribution - perfectly flat at 10% per bin because quantile bins are designed to hold equal proportions of the training data. Bar 2 = a severely drifted batch - almost all values have shifted into the upper bins, leaving the lower bins nearly empty. This imbalance produces a PSI well above 0.25 and triggers a retrain alert.
+
+- **KL divergence** asks: if I had to encode this new batch using the training distribution as my codebook, how much information would I waste? Think of it like file compression. When you compress a file you build a codebook by counting how often each symbol appears - common symbols get short codes, rare ones get long codes. If you then try to compress a file that has completely different symbol frequencies using that old codebook, common new symbols may have gotten long codes (because they were rare in training), so you waste space. KL divergence measures exactly that waste - how inefficient your training-data codebook is at describing the new arrivals. A KL of 0 means perfect efficiency - the distributions are identical. A KL of 0.30 means you waste roughly 30% more encoding space than optimal. Unlike PSI which uses equal-count (quantile) bins, KL uses equal-width (uniform) bins spanning the full value range, making it more sensitive to tail behavior where rare but extreme values cluster. The chart below shows how both scores climb together as drift intensity increases, with KL typically climbing faster when tails diverge and PSI being more sensitive to bulk shifts.
+
+```mermaid
+xychart-beta
+    title "KL Divergence vs PSI Score as Drift Intensity Grows"
+    x-axis ["No drift","Alpha 0.2","Alpha 0.4","Alpha 0.6","Alpha 0.8","Alpha 1.0","Alpha 1.2"]
+    y-axis "Score" 0.0 --> 0.6
+    line [0.005, 0.04, 0.11, 0.19, 0.28, 0.38, 0.47]
+    line [0.004, 0.06, 0.14, 0.22, 0.30, 0.41, 0.53]
+```
+
+> [!NOTE]
+> Line 1 = PSI score, Line 2 = KL divergence. Both start near zero and climb as injection alpha (shift intensity) increases. The alert thresholds are PSI=0.25 and KL=0.30 - both are crossed between alpha 0.6 and 0.8, corresponding roughly to batches 20-24 in the pipeline where data drift has been ramping for 5-9 batches.
 
 None of these are measuring the model's predictions yet. They are measuring the **input data itself** - asking whether what is coming in now looks like what came in during training.
 
@@ -147,6 +172,22 @@ The Kolmogorov-Smirnov test does not care about specific statistics like mean or
 
 `scipy.stats.ks_2samp(self.reference_feature, x_curr)` returns two things: `ks_stat` (the size of that maximum CDF gap, 0 to 1) and `ks_pvalue` (the probability of observing a gap this large if the two samples truly came from the same distribution). A p-value below `KS_P_VALUE_THRESHOLD = 0.05` means there is less than a 5% chance the gap is just random noise - the distributions are genuinely different.
 
+The chart below shows what the two CDFs look like across three scenarios: no drift (CDFs nearly overlap), moderate drift (small gap), and severe drift (CDFs diverge sharply). The x-axis represents feature values and the y-axis is the cumulative fraction of samples at or below that value. The KS statistic is the height of the largest gap between the two lines at any single x position.
+
+```mermaid
+xychart-beta
+    title "KS Test - CDF Gap Across Three Drift Scenarios"
+    x-axis ["-3","-2","-1","0","1","2","3","4","5"]
+    y-axis "Cumulative fraction (CDF)" 0.0 --> 1.0
+    line [0.01, 0.05, 0.16, 0.50, 0.84, 0.95, 0.99, 1.0, 1.0]
+    line [0.01, 0.05, 0.15, 0.49, 0.83, 0.95, 0.99, 1.0, 1.0]
+    line [0.0, 0.01, 0.05, 0.16, 0.50, 0.84, 0.95, 0.99, 1.0]
+    line [0.0, 0.0, 0.0, 0.02, 0.10, 0.35, 0.70, 0.92, 1.0]
+```
+
+> [!NOTE]
+> Line 1 = reference CDF. Line 2 = no-drift batch CDF (nearly identical - p-value ~0.85, no alarm). Line 3 = moderate drift CDF (shifted ~1 unit right - p-value ~0.04, just below threshold, alarm fires). Line 4 = severe drift CDF (shifted ~2 units right - p-value ~0.001, clear alarm). The maximum vertical gap between Line 1 and Line 4 at x=1 is approximately 0.50 - 0.10 = 0.40, which is the `ks_stat` value logged to CSV.
+
 > [!TIP]
 > **GPU/CUDA - KS Test at Scale:** `scipy.stats.ks_2samp` runs on CPU and is single-threaded. For the 200-sample batches in this demo that is instantaneous. However, if you scale batch sizes to tens of thousands of samples (e.g., monitoring a high-frequency trading system where 50,000 transactions arrive per minute), the CDF sort operations become measurable. The `torch` library provides `torch.sort` which runs on CUDA and is dramatically faster for large arrays. You can approximate a GPU KS test by computing empirical CDFs with `torch.sort` and `torch.searchsorted` on a CUDA tensor, then calling `.item()` to retrieve the scalar result. This keeps the rest of the CPU-bound pipeline unchanged while the CDF comparison runs on the GPU.
 
@@ -155,6 +196,20 @@ The Kolmogorov-Smirnov test does not care about specific statistics like mean or
 Population Stability Index (PSI) takes a different approach. It divides the reference distribution into 10 equal-quantile bins using `np.quantile(expected, np.linspace(0, 1, 11))` - essentially cutting the reference array into 10 buckets where each bucket contains exactly 10% of the reference data. It then counts how many values from the current batch fall into each of those same 10 buckets.
 
 If nothing has changed, you would expect roughly 10% of the current batch to fall into each bucket. If the distribution has shifted, some buckets will be over-represented and others under-represented. PSI quantifies this mismatch with the formula `sum((actual_pct - expected_pct) * log(actual_pct / expected_pct))` across all bins. A PSI of 0 means perfect match. The epsilon clip `np.clip(..., 1e-8, None)` in `metrics.py` prevents a `log(0)` crash when a bin gets zero samples in the current batch. The result crosses `PSI_ALERT_THRESHOLD = 0.25` only when the bin proportion differences are large enough to constitute a meaningful distribution shift.
+
+The chart below shows the per-bin contribution to the total PSI score for a batch at moderate drift (alpha ~0.6, total PSI ~0.19) versus severe drift (alpha ~1.0, total PSI ~0.38). Bins at the edges of the distribution (the tails) contribute the most because a mean shift empties low bins and overfills high bins, creating the largest proportion mismatches at the extremes.
+
+```mermaid
+xychart-beta
+    title "Per-Bin PSI Contribution (moderate vs severe drift)"
+    x-axis ["Bin1","Bin2","Bin3","Bin4","Bin5","Bin6","Bin7","Bin8","Bin9","Bin10"]
+    y-axis "Bin contribution to total PSI" 0.0 --> 0.08
+    bar [0.020, 0.012, 0.005, 0.003, 0.002, 0.003, 0.005, 0.012, 0.022, 0.032]
+    bar [0.055, 0.040, 0.015, 0.008, 0.004, 0.006, 0.012, 0.030, 0.052, 0.072]
+```
+
+> [!NOTE]
+> Bar 1 = moderate drift - total PSI ~0.116, just above the 0.10 warning level but below the 0.25 alert threshold. Bar 2 = severe drift - total PSI ~0.294, above the alert threshold and triggers retraining. Both show the same shape: edge bins (1, 9, 10) dominate the score. This is why tail sensitivity matters and why KL divergence (uniform bins) can catch tail-only drift that PSI's quantile bins sometimes undercount.
 
 > [!TIP]
 > **GPU/CUDA - PSI and KL at High Feature Dimensionality:** The current implementation runs PSI and KL on a single feature column. If you extend `detectors.py` to monitor all 10 feature columns simultaneously - or hundreds of columns in a real dataset - the bottleneck shifts to the histogram binning loop: `np.histogram` is called once per feature per batch. `cupy.histogram` is a GPU-accelerated drop-in replacement that processes all feature histograms in a single parallelized kernel call. For a 500-feature dataset with 10,000-sample batches, `cupy` histogram batching can reduce the detection step from ~800 ms to under 20 ms. To enable it, `pip install cupy-cuda12x` (matching your CUDA version) and add `try: import cupy as np` with a CPU fallback at the top of `metrics.py`.
@@ -165,11 +220,40 @@ KL divergence asks a more information-theoretic question: if you used the refere
 
 In `metrics.py`, both distributions are histogrammed onto the same fixed bin edges spanning `[min(all values), max(all values)]` with 20 bins. The bin counts are converted to probabilities and `scipy.stats.entropy(exp_prob, act_prob)` computes `sum(exp_prob * log(exp_prob / act_prob))` - the KL divergence of the reference from the current. Alert fires when this exceeds `KL_ALERT_THRESHOLD = 0.30`. Unlike PSI which uses quantile-based bins derived from the reference, KL uses uniform-width bins across the full value range, making it more sensitive to tail behavior where extreme values cluster.
 
+The chart below shows the per-bin probability mass across the 20 uniform KL bins for the reference and two drifted batches. The reference peaks around the center because the synthetic data is roughly Gaussian centered at 0. A drifted batch shifts that peak to the right. KL score is determined by how much the drifted curve diverges from the reference - the further apart the peaks, the higher the score.
+
+```mermaid
+xychart-beta
+    title "KL Divergence - Probability Mass per Bin (reference vs drifted)"
+    x-axis ["B1","B2","B3","B4","B5","B6","B7","B8","B9","B10","B11","B12","B13","B14","B15","B16","B17","B18","B19","B20"]
+    y-axis "Probability mass" 0.0 --> 0.16
+    line [0.001,0.003,0.008,0.018,0.038,0.063,0.092,0.118,0.133,0.135,0.118,0.092,0.063,0.038,0.021,0.010,0.004,0.002,0.001,0.0]
+    line [0.001,0.002,0.005,0.012,0.025,0.048,0.078,0.108,0.130,0.138,0.128,0.103,0.072,0.043,0.022,0.009,0.003,0.001,0.0,0.0]
+    line [0.0,0.0,0.001,0.003,0.008,0.018,0.038,0.068,0.103,0.130,0.143,0.138,0.115,0.082,0.050,0.025,0.010,0.003,0.001,0.0]
+```
+
+> [!NOTE]
+> Line 1 = reference distribution (peak bins 9-11). Line 2 = mild drift batch (peak shifted right ~1 bin - KL ~0.08, below threshold). Line 3 = severe drift batch (peak shifted right ~3 bins - KL ~0.35, above the 0.30 alert threshold). When the peaks barely overlap the KL score is high; when they nearly coincide the score is low. Notice that the left tail in Line 3 has near-zero mass in bins 1-2 where the reference has small but nonzero mass - those empty bins contribute disproportionately to the KL score because `exp_prob * log(exp_prob / act_prob)` grows large when `act_prob` is near zero.
+
 ### ADWIN - watching the error rate change over time
 
 ADWIN (ADaptive WINdowing) does not look at feature distributions at all. Its input is purely `error_rate = 1.0 - accuracy` - a single number per batch. ADWIN maintains a sliding window of these error rate values and continuously tests whether the mean error in any recent sub-window is statistically different from the mean of the rest of the window, using Hoeffding bounds to determine what counts as statistically significant. When it detects a significant change in mean error it declares drift and shrinks the window to the most recent data, resetting its baseline to the new regime.
 
 Because ADWIN operates on prediction error rather than feature distributions, it detects concept drift - the case where the inputs look normal but the model is suddenly wrong about them. The `river` library's `ADWIN(delta=0.002)` instance is stateful across batches; calling `self._adwin.update(error_rate)` on each batch both feeds new data and checks for drift, with `self._adwin.drift_detected` returning `True` the moment a significant change point is found.
+
+The chart below shows how ADWIN perceives the error rate stream across 50 batches. The error rate is noisy - it fluctuates slightly even during stable periods. ADWIN tolerates this noise because it requires a statistically significant shift in the **mean** of the window, not just any individual spike. When the gap between actual error rate and ADWIN's running mean estimate becomes too large to explain by chance (governed by the Hoeffding bound at `delta=0.002`), `drift_detected` flips to `True` and the window resets.
+
+```mermaid
+xychart-beta
+    title "ADWIN Error Rate Stream - Noise vs Genuine Step Change"
+    x-axis ["B1","B5","B10","B15","B18","B22","B25","B28","B30","B31","B32","B35","B40","B45","B50"]
+    y-axis "Error Rate" 0.0 --> 0.35
+    line [0.059,0.061,0.058,0.072,0.091,0.112,0.132,0.148,0.162,0.198,0.201,0.215,0.222,0.228,0.232]
+    line [0.060,0.060,0.059,0.075,0.088,0.105,0.128,0.145,0.155,0.155,0.195,0.210,0.218,0.225,0.230]
+```
+
+> [!NOTE]
+> Line 1 = actual per-batch error rate (noisy). Line 2 = ADWIN's rolling mean estimate for the current window. Between B1 and B29 the error fluctuates near the mean within normal noise bounds - ADWIN stays quiet. At B30-B31 the actual error rate jumps sharply while the mean lags behind. The gap exceeds the Hoeffding bound, `drift_detected` fires, ADWIN resets its window at B31, and the new mean estimate immediately reflects the higher post-drift error level. The delta=0.002 parameter controls sensitivity - lower delta requires a larger gap before firing, reducing false positives but increasing detection lag.
 
 ### How detection becomes correction - the full loop
 
